@@ -149,6 +149,55 @@ class SizzleTest {
     }
 
     @Test
+    void planEdgeCases() {
+        // Probability extremes: p=0 never crashes, p=1 always does — no off-by-boundary.
+        ChaosPlan never = ChaosPlan.crashWithProbability(7, 0.0);
+        ChaosPlan always = ChaosPlan.crashWithProbability(7, 1.0);
+        for (long op = 1; op <= 500; op++) {
+            assertTrue(!never.crashesAt(op), "p=0 must never crash (op " + op + ")");
+            assertTrue(always.crashesAt(op), "p=1 must always crash (op " + op + ")");
+        }
+
+        // Composition: and() crashes when EITHER side does, and takes the larger latency.
+        ChaosPlan combined = ChaosPlan.crashOnceAtOp(3).withLatencyMillis(2)
+                .and(ChaosPlan.crashEveryNthOp(10).withLatencyMillis(5));
+        assertTrue(combined.crashesAt(3), "left side's crash survives and()");
+        assertTrue(combined.crashesAt(10), "right side's crash survives and()");
+        assertTrue(combined.crashesAt(20), "periodic rule keeps firing through and()");
+        assertTrue(!combined.crashesAt(4) && !combined.crashesAt(11), "quiet ops stay quiet");
+        assertEquals(5, combinedLatency(combined), "and() takes the larger latency");
+
+        // Argument domain: caller defects are refused loudly, at construction.
+        assertThrows(IllegalArgumentException.class, () -> ChaosPlan.crashOnceAtOp(0));
+        assertThrows(IllegalArgumentException.class, () -> ChaosPlan.crashEveryNthOp(0));
+        assertThrows(IllegalArgumentException.class, () -> ChaosPlan.crashWithProbability(1, -0.1));
+        assertThrows(IllegalArgumentException.class, () -> ChaosPlan.crashWithProbability(1, 1.1));
+        assertThrows(IllegalArgumentException.class, () -> ChaosPlan.none().withLatencyMillis(-1));
+    }
+
+    private static long combinedLatency(ChaosPlan plan) {
+        return plan.latencyMillis();                           // package-private accessor
+    }
+
+    @Test
+    void aRetryGetsPastAOnceAtFault(@TempDir Path storeDir) throws IOException {
+        // The op counter advances even on a crashed op, so a caller that retries the same
+        // write through the same Sizzle sees: transient fault, then recovery — exactly the
+        // contract the class documents.
+        try (SmokeHouse<Long, String> store = SmokeHouse.open(storeDir, opts())) {
+            Sizzle<Long, String> chaos = Sizzle.over(store, ChaosPlan.crashOnceAtOp(1));
+            Twine.PutSink<Long, String> sink = chaos.puts();
+            assertThrows(Sizzle.Crash.class, () -> sink.put(1L, "first try"));
+            assertEquals(0, store.size(), "the crashed op never reached the store");
+            sink.put(1L, "second try");                        // op 2: past the fault
+            assertEquals(1, store.size(), "the retry lands");
+            assertEquals("second try", store.get(1L));
+            assertEquals(2, chaos.opsSeen());
+            assertEquals(1, chaos.crashesInjected());
+        }
+    }
+
+    @Test
     void latencyIsActuallyInjected(@TempDir Path storeDir) throws IOException {
         try (SmokeHouse<Long, String> store = SmokeHouse.open(storeDir, opts())) {
             Sizzle<Long, String> chaos = Sizzle.over(store,
