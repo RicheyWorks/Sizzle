@@ -1,6 +1,8 @@
 package io.github.richeyworks.sizzle;
 
 import io.github.richeyworks.smokehouse.SmokeHouse;
+import io.github.richeyworks.smokehouse.TailEvent;
+import io.github.richeyworks.smokehouse.TailListener;
 import io.github.richeyworks.twine.Twine;
 
 import java.io.IOException;
@@ -112,6 +114,38 @@ public final class Sizzle<K, V> {
             crashes.incrementAndGet();
             throw new Crash("Sizzle injected a crash at op " + op + " (" + what + ")");
         }
+    }
+
+    /**
+     * Chaos for tail consumers (2026-08-20): wrap a {@link TailListener} so every delivery
+     * stalls {@code millis} first — the honest way to make a consumer fall behind. Composed
+     * with a small tail ring ({@code SmokeHouseOptions.tailRing}), this turns the drop-oldest
+     * contract into something you can actually trigger: the wrapped listener genuinely lags,
+     * the ring genuinely overruns, and {@code onGap()} genuinely fires — no mocks, no fake
+     * gaps. {@code onGap} passes through undelayed: chaos slows the consumer, never the truth
+     * about what the consumer missed.
+     */
+    public static <K, V> TailListener<K, V> slow(TailListener<K, V> inner, long millis) {
+        Objects.requireNonNull(inner, "inner");
+        if (millis < 0) {
+            throw new IllegalArgumentException("latency must be >= 0: " + millis);
+        }
+        return new TailListener<K, V>() {
+            @Override
+            public void onEvent(TailEvent<K, V> event) {
+                try {
+                    Thread.sleep(millis);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                inner.onEvent(event);
+            }
+
+            @Override
+            public void onGap() {
+                inner.onGap();                                 // the truth is never delayed
+            }
+        };
     }
 
     /** Total ops that have passed through the wrapped sinks (crashed ops included). */

@@ -198,6 +198,56 @@ class SizzleTest {
     }
 
     @Test
+    void aSlowedConsumerEarnsARealGap(@TempDir Path storeDir) throws IOException {
+        // Sizzle.slow + a tiny tail ring: the wrapped listener genuinely lags, the ring
+        // genuinely overruns, and onGap genuinely fires — chaos proving the drop-oldest
+        // contract with no mocks and no fake gaps.
+        java.util.concurrent.atomic.AtomicLong gaps = new java.util.concurrent.atomic.AtomicLong();
+        java.util.concurrent.atomic.AtomicLong seen = new java.util.concurrent.atomic.AtomicLong();
+        SmokeHouseOptions<Long, String> tinyRing =
+                SmokeHouseOptions.of(SpillSerializer.forLongs(), SpillSerializer.forStrings())
+                        .indexTier(SmokeHouseOptions.IndexTier.STATIC)
+                        .tailRing(8);
+        try (SmokeHouse<Long, String> store = SmokeHouse.open(storeDir, tinyRing)) {
+            AutoCloseable sub = store.tail(0, Sizzle.slow(
+                    new io.github.richeyworks.smokehouse.TailListener<Long, String>() {
+                        @Override public void onEvent(
+                                io.github.richeyworks.smokehouse.TailEvent<Long, String> e) {
+                            seen.incrementAndGet();
+                        }
+                        @Override public void onGap() {
+                            gaps.incrementAndGet();
+                        }
+                    }, 3));
+            for (long k = 0; k < 400; k++) {
+                store.put(k, "v" + k);
+            }
+            long deadline = System.currentTimeMillis() + 15_000;
+            while (gaps.get() == 0 && System.currentTimeMillis() < deadline) {
+                try {
+                    Thread.sleep(2);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+            assertTrue(gaps.get() > 0, "the slowed consumer was told about its gap");
+            assertTrue(seen.get() < 400, "and it genuinely missed events");
+            try {
+                sub.close();
+            } catch (Exception e) {
+                throw new IOException("closing subscriber", e);
+            }
+        }
+        // Argument domain, same discipline as ChaosPlan.
+        assertThrows(IllegalArgumentException.class,
+                () -> Sizzle.slow(new io.github.richeyworks.smokehouse.TailListener<Long, String>() {
+                    @Override public void onEvent(
+                            io.github.richeyworks.smokehouse.TailEvent<Long, String> e) { }
+                }, -1));
+    }
+
+    @Test
     void latencyIsActuallyInjected(@TempDir Path storeDir) throws IOException {
         try (SmokeHouse<Long, String> store = SmokeHouse.open(storeDir, opts())) {
             Sizzle<Long, String> chaos = Sizzle.over(store,
