@@ -79,22 +79,25 @@ class SizzleTest {
             Path storeDir = base.resolve("store-" + crashPoint);
             Path journalDir = base.resolve("journal-" + crashPoint);
 
-            // Crash the batch at op `crashPoint`, mid-apply.
+            // Crash the batch at op `crashPoint`, mid-apply. A real crash is process death, which
+            // releases the OS lock on the journal dir; here the JVM survives, so we close the
+            // faulted Twine explicitly (T1's exclusive lock forbids a second live Twine otherwise).
             try (SmokeHouse<Long, String> store = SmokeHouse.open(storeDir, opts())) {
                 Sizzle<Long, String> chaos = Sizzle.over(store, ChaosPlan.crashOnceAtOp(crashPoint));
-                Twine<Long, String> twine = Twine.over(chaos.puts(), chaos.deletes(), journalDir,
-                        SpillSerializer.forLongs(), SpillSerializer.forStrings());
-                Twine<Long, String>.Batch batch = twine.batch();
-                stage(batch);
-                assertThrows(Sizzle.Crash.class, batch::commit,
-                        "the injected crash must surface out of commit");
-                assertEquals(1, chaos.crashesInjected(), "exactly one fault at crash point " + crashPoint);
+                try (Twine<Long, String> twine = Twine.over(chaos.puts(), chaos.deletes(), journalDir,
+                        SpillSerializer.forLongs(), SpillSerializer.forStrings())) {
+                    Twine<Long, String>.Batch batch = twine.batch();
+                    stage(batch);
+                    assertThrows(Sizzle.Crash.class, batch::commit,
+                            "the injected crash must surface out of commit");
+                    assertEquals(1, chaos.crashesInjected(), "exactly one fault at crash point " + crashPoint);
+                }
             }
 
             // Reopen (the process 'restarts'): Twine replays the committed journal on construction.
-            try (SmokeHouse<Long, String> revived = SmokeHouse.open(storeDir, opts())) {
-                Twine.over(revived::put, revived::delete, journalDir,
-                        SpillSerializer.forLongs(), SpillSerializer.forStrings());   // replay
+            try (SmokeHouse<Long, String> revived = SmokeHouse.open(storeDir, opts());
+                 Twine<Long, String> ignored = Twine.over(revived::put, revived::delete, journalDir,
+                        SpillSerializer.forLongs(), SpillSerializer.forStrings())) {   // replay
                 assertEquals(expected, scan(revived),
                         "after crash at op " + crashPoint + ", the batch landed exactly once");
             }
@@ -109,20 +112,21 @@ class SizzleTest {
 
         try (SmokeHouse<Long, String> store = SmokeHouse.open(storeDir, opts())) {
             Sizzle<Long, String> chaos = Sizzle.over(store, ChaosPlan.none());
-            Twine<Long, String> twine = Twine.over(chaos.puts(), chaos.deletes(), journalDir,
-                    SpillSerializer.forLongs(), SpillSerializer.forStrings());
-            Twine<Long, String>.Batch batch = twine.batch();
-            stage(batch);
-            batch.commit();
+            try (Twine<Long, String> twine = Twine.over(chaos.puts(), chaos.deletes(), journalDir,
+                    SpillSerializer.forLongs(), SpillSerializer.forStrings())) {
+                Twine<Long, String>.Batch batch = twine.batch();
+                stage(batch);
+                batch.commit();
 
-            assertEquals(BATCH.size(), chaos.opsSeen(), "every op passed through the quiet sink");
-            assertEquals(0, chaos.crashesInjected(), "none plan injects nothing");
-            assertEquals(expected, scan(store), "the batch's net effect is present");
+                assertEquals(BATCH.size(), chaos.opsSeen(), "every op passed through the quiet sink");
+                assertEquals(0, chaos.crashesInjected(), "none plan injects nothing");
+                assertEquals(expected, scan(store), "the batch's net effect is present");
+            }   // closing releases the journal-dir lock so the reopen below can tie
         }
         // Reopen: journal was deleted after a clean commit, so replay finds nothing to do.
-        try (SmokeHouse<Long, String> revived = SmokeHouse.open(storeDir, opts())) {
-            Twine.over(revived::put, revived::delete, journalDir,
-                    SpillSerializer.forLongs(), SpillSerializer.forStrings());
+        try (SmokeHouse<Long, String> revived = SmokeHouse.open(storeDir, opts());
+             Twine<Long, String> ignored = Twine.over(revived::put, revived::delete, journalDir,
+                    SpillSerializer.forLongs(), SpillSerializer.forStrings())) {
             assertEquals(expected, scan(revived), "a clean commit leaves nothing to replay");
         }
     }
